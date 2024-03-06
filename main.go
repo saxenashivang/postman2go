@@ -4,132 +4,269 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
+	"text/template"
 )
 
-// PostmanCollection represents the structure of a Postman Collection.
 type PostmanCollection struct {
-	Info struct {
-		Name string `json:"name"`
-	} `json:"info"`
-	Item []struct {
-		Name string `json:"name"`
-		Item []struct {
-			Name     string     `json:"name"`
-			Request  Request    `json:"request"`
-			Response []Response `json:"response"`
-		} `json:"item"`
-	} `json:"item"`
-}
-type Response struct {
-	Name string `json:"name"`
+	Info     Info       `json:"info"`
+	Items    []Item     `json:"item"`
+	Variable []Variable `json:"variable"`
 }
 
-// Request represents an HTTP request.
+type Info struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+type Item struct {
+	Name        string        `json:"name"`
+	Request     Request       `json:"request"`
+	Response    []interface{} `json:"response"`
+	Event       []Event       `json:"event"`
+	Description string        `json:"description"`
+}
+
 type Request struct {
-	Method string `json:"method"`
-	URL    struct {
-		Raw string `json:"raw"`
-	} `json:"url"`
-	Header  []Header `json:"header"`
-	Body    *Body    `json:"body"`
-	Auth    *Auth    `json:"auth"`
-	Example string   `json:"example"`
+	Method string          `json:"method"`
+	Header []interface{}   `json:"header"`
+	Body   json.RawMessage `json:"body"`
+	URL    URL             `json:"url"`
 }
 
-// Header represents an HTTP header.
-type Header struct {
+type URL struct {
+	Raw   string       `json:"raw"`
+	Host  []string     `json:"host"`
+	Path  []string     `json:"path"`
+	Query []QueryParam `json:"query"`
+}
+
+type QueryParam struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
 }
 
-// Body represents the body of an HTTP request.
-type Body struct {
-	Mode string `json:"mode"`
-	Raw  string `json:"raw"`
+type Event struct {
+	Listen string `json:"listen"`
+	Script Script `json:"script"`
 }
 
-// Auth represents the authentication details for an HTTP request.
-type Auth struct {
-	Type   string `json:"type"`
-	Bearer []struct {
-		Key   string `json:"key"`
-		Value string `json:"value"`
-	} `json:"bearer"`
+type Script struct {
+	Type string   `json:"type"`
+	Exec []string `json:"exec"`
+}
+
+type Variable struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
 }
 
 func main() {
-	// Read the Postman Collection JSON file
-	data, err := os.ReadFile("postman_collection.json")
+	file, err := os.Open("basic_collection.json")
 	if err != nil {
-		fmt.Println("Error reading Postman Collection JSON:", err)
+		fmt.Println("Error opening file:", err)
 		return
 	}
+	defer file.Close()
 
-	// Unmarshal JSON
 	var collection PostmanCollection
-	err = json.Unmarshal(data, &collection)
+	err = json.NewDecoder(file).Decode(&collection)
 	if err != nil {
-		fmt.Println("Error parsing Postman Collection JSON:", err)
+		fmt.Println("Error decoding JSON:", err)
 		return
 	}
 
-	// Create a directory for the package
-	dirName := strings.ToLower(strings.ReplaceAll(collection.Info.Name, " ", "_"))
-	err = os.Mkdir(dirName, 0755)
+	funcMap := template.FuncMap{
+		"joinStrings": joinStrings,
+		"joinLines":   joinLines,
+		"replace":     strings.Replace,
+		"replaceAll":  strings.ReplaceAll,
+	}
+
+	tmplStr := `{{ $funcName := .Name | joinStrings | replaceAll " " "_" }}
+package razorpay
+
+import (
+    "bytes"
+    "encoding/json"
+    "io"
+    "net/http"
+
+    "github.com/myproject/config"
+    "github.com/myproject/constants"
+    "github.com/myproject/models"
+    "github.com/myproject/utils"
+    "github.com/pkg/errors"
+)
+
+// {{ .Name }}
+func {{ $funcName }}(c *gin.Context, reqBody models.{{ .Name }}Req) (models.ProvidersRes, error) {
+    var err error
+    var res models.ProvidersRes
+    res.ProviderName = constants.Providers.RAZORPAY
+    url := config.Razorpay.Url + "{{ .Request.URL.Path }}"
+
+    reqJson, err := json.Marshal(reqBody)
+    if err != nil {
+        return res, errors.Wrap(err, "[{{ $funcName }}][Marshal]")
+    }
+
+    // sandbox:true request returns mock response
+    authData, err := utils.GetAuthData(c)
+    if err != nil {
+        return res, errors.Wrap(err, "[{{ $funcName }}][GetAuthData]")
+    }
+    if authData.Sandbox {
+        res.ProviderResponseCode = http.StatusOK
+        res.ProviderResponse = mock{{ $funcName }}200(c, reqBody)
+        return res, err
+    }
+
+    req, _ := http.NewRequest("{{ .Request.Method }}", url, bytes.NewBuffer(reqJson))
+
+    // this is the auth string required to be converted to base 64 as auth
+    auth := config.Razorpay.KeyId + ":" + config.Razorpay.KeySecret
+    auth = utils.Str2Base64(auth)
+
+    {{ if .Request.Header }}
+    // Add headers
+    {{ range $header := .Request.Header }}
+    req.Header.Add("{{ $header.Key }}", "{{ $header.Value }}")
+    {{ end }}
+    {{ end }}
+
+    response, err := http.DefaultClient.Do(req)
+    if err != nil {
+        return res, errors.Wrap(err, "[{{ $funcName }}]")
+    }
+    res.ProviderResponseCode = response.StatusCode
+
+    defer response.Body.Close()
+    body, err := io.ReadAll(response.Body)
+    if err != nil {
+        return res, errors.Wrap(err, "[{{ $funcName }}][ReadAll]")
+    }
+
+    res.ProviderResponse = string(body)
+    return res, err
+}
+`
+
+	tmpl, err := template.New("request_template.gohtml").Funcs(funcMap).Parse(tmplStr)
 	if err != nil {
-		fmt.Println("Error creating directory:", err)
+		fmt.Println("Error parsing template:", err)
 		return
 	}
 
-	// Generate Go code for request and response models
-	for _, group := range collection.Item {
-		for _, item := range group.Item {
-			// Write request model
-			requestFileName := strings.ToLower(strings.ReplaceAll(item.Name, " ", "_")) + "_request.go"
-			requestFilePath := filepath.Join(dirName, requestFileName)
-			err = os.WriteFile(requestFilePath, []byte(generateRequestModel(item.Request)), 0644)
+	// Create a folder for the collection
+	folderName := strings.ReplaceAll(strings.ToLower(collection.Info.Name), " ", "_")
+	err = os.Mkdir(folderName, 0755)
+	if err != nil {
+		fmt.Println("Error creating folder:", err)
+		return
+	}
+
+	// Create models.go file
+	modelsFile, err := os.Create(folderName + "/models.go")
+	if err != nil {
+		fmt.Println("Error creating models.go file:", err)
+		return
+	}
+	defer modelsFile.Close()
+
+	// Write struct definitions for requests and responses in models.go
+	// Write struct definitions for requests and responses in models.go
+	for _, item := range collection.Items {
+		structName := item.Name + "Req"
+		structName = strings.ReplaceAll(structName, " ", "")
+
+		_, err = modelsFile.WriteString(fmt.Sprintf("type %s struct {\n", structName))
+		if err != nil {
+			fmt.Println("Error writing to models.go file:", err)
+			return
+		}
+
+		if item.Request.Body != nil {
+			var reqBody map[string]interface{}
+			err = json.Unmarshal(item.Request.Body, &reqBody)
 			if err != nil {
-				fmt.Println("Error writing request model:", err)
+				fmt.Println("Error unmarshaling request body:", err)
 				return
 			}
 
-			// Write response model
-			responseFileName := strings.ToLower(strings.ReplaceAll(item.Name, " ", "_")) + "_response.go"
-			responseFilePath := filepath.Join(dirName, responseFileName)
-			err = os.WriteFile(responseFilePath, []byte(generateResponseModel(item.Response)), 0644)
-			if err != nil {
-				fmt.Println("Error writing response model:", err)
-				return
+			for key, value := range reqBody {
+				fieldType, err := inferType(value)
+				if err != nil {
+					fmt.Println("Error inferring type:", err)
+					return
+				}
+
+				_, err = modelsFile.WriteString(fmt.Sprintf("\t%s %s `json:\"%s\"`\n", key, fieldType, key))
+				if err != nil {
+					fmt.Println("Error writing to models.go file:", err)
+					return
+				}
 			}
 		}
+
+		_, err = modelsFile.WriteString("}\n\n")
+		if err != nil {
+			fmt.Println("Error writing to models.go file:", err)
+			return
+		}
 	}
-	fmt.Println("Go code generated successfully!")
+
+	for _, item := range collection.Items {
+		fileName := folderName + "/" + strings.ReplaceAll(strings.ToLower(item.Name), " ", "_") + ".go"
+		file, err := os.Create(fileName)
+		if err != nil {
+			fmt.Println("Error creating file:", err)
+			return
+		}
+		defer file.Close()
+
+		err = tmpl.Execute(file, item)
+		if err != nil {
+			fmt.Println("Error executing template:", err)
+			return
+		}
+	}
 }
 
-// generateRequestModel generates Go code for the request model.
-func generateRequestModel(req Request) string {
-	// Here you can write code to generate Go structs representing the request model
-	// Example code generation:
-	return fmt.Sprintf(`
-package %s
+func joinStrings(input interface{}) string {
+	var strs []string
 
-// %sRequest represents the request for %s.
-type %sRequest struct {
-	// Define struct fields based on request parameters
-}`, strings.ToLower(strings.ReplaceAll(req.URL.Raw, " ", "_")), strings.ReplaceAll(req.URL.Raw, " ", ""), req.URL.Raw, strings.ReplaceAll(req.URL.Raw, " ", ""))
+	switch value := input.(type) {
+	case []string:
+		strs = value
+	case string:
+		strs = []string{value}
+	default:
+		return ""
+	}
+
+	return strings.Join(strs, ", ")
 }
 
-// generateResponseModel generates Go code for the response model.
-func generateResponseModel(responses []Response) string {
-	// Here you can write code to generate Go structs representing the response model
-	// Example code generation:
-	return `
-package main
+func joinLines(strs []string) string {
+	return strings.Join(strs, "\n")
+}
 
-// Response represents the response for the API call.
-type Response struct {
-	// Define struct fields based on response properties
-}`
+func inferType(value interface{}) (string, error) {
+	switch value.(type) {
+	case string:
+		return "string", nil
+	case float64:
+		return "float64", nil
+	case bool:
+		return "bool", nil
+	case nil:
+		return "interface{}", nil
+	case map[string]interface{}:
+		return "map[string]interface{}", nil
+	case []interface{}:
+		return "[]interface{}", nil
+	default:
+		return "", fmt.Errorf("unknown type %T", value)
+	}
 }

@@ -1,0 +1,67 @@
+{{ $funcName := .Name | joinStrings | replaceAll " " "_" }}
+package razorpay
+
+import (
+    "bytes"
+    "encoding/json"
+    "io"
+    "net/http"
+
+    "github.com/myproject/config"
+    "github.com/myproject/constants"
+    "github.com/myproject/models"
+    "github.com/myproject/utils"
+    "github.com/pkg/errors"
+)
+
+// {{ .Name }}
+func {{ $funcName }}(c *gin.Context, reqBody models.{{ .Name }}Req) (models.ProvidersRes, error) {
+    var err error
+    var res models.ProvidersRes
+    res.ProviderName = constants.Providers.RAZORPAY
+    url := config.Razorpay.Url + "{{ .Request.URL.Path }}"
+
+    reqJson, err := json.Marshal(reqBody)
+    if err != nil {
+        return res, errors.Wrap(err, "[{{ $funcName }}][Marshal]")
+    }
+
+    // sandbox:true request returns mock response
+    authData, err := utils.GetAuthData(c)
+    if err != nil {
+        return res, errors.Wrap(err, "[{{ $funcName }}][GetAuthData]")
+    }
+    if authData.Sandbox {
+        res.ProviderResponseCode = http.StatusOK
+        res.ProviderResponse = mock{{ $funcName }}200(c, reqBody)
+        return res, err
+    }
+
+    req, _ := http.NewRequest("{{ .Request.Method }}", url, bytes.NewBuffer(reqJson))
+
+    // this is the auth string required to be converted to base 64 as auth
+    auth := config.Razorpay.KeyId + ":" + config.Razorpay.KeySecret
+    auth = utils.Str2Base64(auth)
+
+    {{ if .Request.Header }}
+    // Add headers
+    {{ range $header := .Request.Header }}
+    req.Header.Add("{{ $header.Key }}", "{{ $header.Value }}")
+    {{ end }}
+    {{ end }}
+
+    response, err := http.DefaultClient.Do(req)
+    if err != nil {
+        return res, errors.Wrap(err, "[{{ $funcName }}]")
+    }
+    res.ProviderResponseCode = response.StatusCode
+
+    defer response.Body.Close()
+    body, err := io.ReadAll(response.Body)
+    if err != nil {
+        return res, errors.Wrap(err, "[{{ $funcName }}][ReadAll]")
+    }
+
+    res.ProviderResponse = string(body)
+    return res, err
+}
